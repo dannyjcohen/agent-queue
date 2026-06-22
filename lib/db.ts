@@ -1,2 +1,15 @@
-import { neon } from '@neondatabase/serverless';
-export const sql = neon(process.env.DATABASE_URL!);
+import { neon, NeonQueryFunction } from '@neondatabase/serverless';
+
+// Lazy-initialize so the build doesn't fail when DATABASE_URL isn't set.
+// The error is thrown at query time (inside a request handler) rather than
+// at module evaluation time (during the build).
+let _sql: NeonQueryFunction<false, false> | null = null;
+
+export function getDb(): NeonQueryFunction<false, false> {
+  if (!_sql) {
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error('DATABASE_URL is not set');
+    _sql = neon(url);
+  }
+  return _sql;
+}

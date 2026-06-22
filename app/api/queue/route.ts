@@ -1,5 +1,7 @@
-import { sql } from '../../../lib/db';
+import { getDb } from '../../../lib/db';
 import { validateAuth } from '../../../lib/auth';
+
+export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
   if (!validateAuth(req)) {
@@ -16,6 +18,7 @@ export async function POST(req: Request) {
     return Response.json({ error: 'type is required' }, { status: 400 });
   }
 
+  const sql = getDb();
   const rows = await sql`
     INSERT INTO queue_items (type, source, payload)
     VALUES (${type}, ${source as string}, ${JSON.stringify(payload)})

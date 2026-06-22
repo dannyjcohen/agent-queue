@@ -1,5 +1,7 @@
-import { sql } from '../../../../lib/db';
+import { getDb } from '../../../../lib/db';
 import { validateAuth } from '../../../../lib/auth';
+
+export const dynamic = 'force-dynamic';
 
 export async function PATCH(
   req: Request,
@@ -17,6 +19,7 @@ export async function PATCH(
     return Response.json({ error: 'status must be processing, done, or failed' }, { status: 400 });
   }
 
+  const sql = getDb();
   const setProcessedAt = status === 'done' || status === 'failed';
   const rows = setProcessedAt
     ? await sql`
