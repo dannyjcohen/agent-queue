@@ -5,11 +5,12 @@ export const dynamic = 'force-dynamic';
 
 export async function PATCH(
   req: Request,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   if (!validateAuth(req)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  const { id } = await params;
   let body: Record<string, unknown> = {};
   try { body = await req.json(); } catch { /* ignore */ }
 
@@ -25,13 +26,13 @@ export async function PATCH(
     ? await sql`
         UPDATE queue_items
         SET status = ${status}, error = ${error as string}, processed_at = NOW()
-        WHERE id = ${params.id}
+        WHERE id = ${id}::uuid
         RETURNING id, status, processed_at
       `
     : await sql`
         UPDATE queue_items
         SET status = ${status}, error = ${error as string}
-        WHERE id = ${params.id}
+        WHERE id = ${id}::uuid
         RETURNING id, status, processed_at
       `;
 
