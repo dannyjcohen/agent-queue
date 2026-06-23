@@ -14,27 +14,77 @@ export async function PATCH(
   let body: Record<string, unknown> = {};
   try { body = await req.json(); } catch { /* ignore */ }
 
-  const { status, error = null } = body as { status?: string; error?: string };
+  const { status, error = null, result = null } = body as {
+    status?: string;
+    error?: string | null;
+    result?: unknown | null;
+  };
+
   const validStatuses = ['processing', 'done', 'failed'];
-  if (!status || !validStatuses.includes(status)) {
-    return Response.json({ error: 'status must be processing, done, or failed' }, { status: 400 });
+  const hasValidStatus = !!status && validStatuses.includes(status);
+  const hasResult = result !== null && result !== undefined;
+
+  if (!hasValidStatus && !hasResult) {
+    return Response.json(
+      { error: 'provide status (processing|done|failed) and/or result' },
+      { status: 400 }
+    );
   }
 
   const sql = getDb();
-  const setProcessedAt = status === 'done' || status === 'failed';
-  const rows = setProcessedAt
-    ? await sql`
+  const setProcessedAt = hasValidStatus && (status === 'done' || status === 'failed');
+  const resultJson = hasResult ? JSON.stringify(result) : null;
+
+  let rows;
+  if (hasValidStatus && hasResult) {
+    if (setProcessedAt) {
+      rows = await sql`
         UPDATE queue_items
-        SET status = ${status}, error = ${error as string}, processed_at = NOW()
+        SET status = ${status as string},
+            error = ${error as string},
+            processed_at = NOW(),
+            result = ${resultJson}::jsonb
         WHERE id = ${id}::uuid
-        RETURNING id, status, processed_at
-      `
-    : await sql`
-        UPDATE queue_items
-        SET status = ${status}, error = ${error as string}
-        WHERE id = ${id}::uuid
-        RETURNING id, status, processed_at
+        RETURNING id, status, processed_at, error, result
       `;
+    } else {
+      rows = await sql`
+        UPDATE queue_items
+        SET status = ${status as string},
+            error = ${error as string},
+            result = ${resultJson}::jsonb
+        WHERE id = ${id}::uuid
+        RETURNING id, status, processed_at, error, result
+      `;
+    }
+  } else if (hasValidStatus) {
+    if (setProcessedAt) {
+      rows = await sql`
+        UPDATE queue_items
+        SET status = ${status as string},
+            error = ${error as string},
+            processed_at = NOW()
+        WHERE id = ${id}::uuid
+        RETURNING id, status, processed_at, error, result
+      `;
+    } else {
+      rows = await sql`
+        UPDATE queue_items
+        SET status = ${status as string},
+            error = ${error as string}
+        WHERE id = ${id}::uuid
+        RETURNING id, status, processed_at, error, result
+      `;
+    }
+  } else {
+    // hasResult only, no status change
+    rows = await sql`
+      UPDATE queue_items
+      SET result = ${resultJson}::jsonb
+      WHERE id = ${id}::uuid
+      RETURNING id, status, processed_at, error, result
+    `;
+  }
 
   if (rows.length === 0) {
     return Response.json({ error: 'Not found' }, { status: 404 });

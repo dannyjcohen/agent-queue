@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS queue_items (
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','processing','done','failed')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   processed_at TIMESTAMPTZ,
-  error TEXT
+  error TEXT,
+  result JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_queue_items_status ON queue_items(status, created_at);
