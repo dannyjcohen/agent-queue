@@ -1,18 +1,32 @@
 // Throwaway seed script — seeds waiting items for UI testing.
-// Loads QUEUE_API_SECRET from dashboard/.env at runtime via dotenv.
-// Usage: node scripts/seed-waiting-test.js [--clean]
-// Cleans up by PATCHing all seeded items to expired.
+// Loads QUEUE_API_SECRET from dashboard/.env at runtime (no dotenv dep needed).
+// Usage:
+//   node scripts/seed-waiting-test.js          # seed 3 test items
+//   node scripts/seed-waiting-test.js --clean  # expire all seeded items
 //
 // NEVER prints or echoes secrets.
 
-import path from 'path';
-import { fileURLToPath } from 'url';
-import fs from 'fs';
+'use strict';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const envPath = path.resolve(__dirname, '../../../dev/agent-system/dashboard/.env');
+const path = require('path');
+const fs = require('fs');
 
-// Minimal dotenv parser — reads KEY=VALUE, ignores comments and blank lines
+// Resolve dashboard/.env — it lives in the agent-system repo on the local machine.
+// Try a few candidate paths (Windows and Unix-style) in order.
+const candidateEnvPaths = [
+  path.resolve('C:/dev/agent-system/dashboard/.env'),
+  path.resolve('/c/dev/agent-system/dashboard/.env'),
+  path.resolve(__dirname, '../../../../dev/agent-system/dashboard/.env'),
+];
+const envPath = candidateEnvPaths.find(p => {
+  try { fs.accessSync(p); return true; } catch { return false; }
+});
+if (!envPath) {
+  console.error('Could not find dashboard/.env. Tried:', candidateEnvPaths.join(', '));
+  process.exit(1);
+}
+
+// Minimal .env parser — no external dep
 function loadEnv(filePath) {
   const text = fs.readFileSync(filePath, 'utf8');
   const env = {};
@@ -23,7 +37,6 @@ function loadEnv(filePath) {
     if (eq < 0) continue;
     const key = trimmed.slice(0, eq).trim();
     let val = trimmed.slice(eq + 1).trim();
-    // Strip surrounding quotes if present
     if ((val.startsWith('"') && val.endsWith('"')) ||
         (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
@@ -42,8 +55,8 @@ if (!secret) {
 
 const BASE = 'https://agent-queue.vercel.app';
 
-async function post(path, body) {
-  const res = await fetch(`${BASE}${path}`, {
+async function post(urlPath, body) {
+  const res = await fetch(`${BASE}${urlPath}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -53,12 +66,12 @@ async function post(path, body) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`POST ${path} → ${res.status}: ${text}`);
+    throw new Error(`POST ${urlPath} → ${res.status}: ${text}`);
   }
   return res.json();
 }
 
-async function patch(id, body) {
+async function patchItem(id, body) {
   const res = await fetch(`${BASE}/api/waiting/${id}`, {
     method: 'PATCH',
     headers: {
@@ -84,7 +97,6 @@ async function getWaiting() {
 
 const SEED_THREAD_1 = 'seed-thread-aaa-111';
 const SEED_THREAD_2 = 'seed-thread-bbb-222';
-const SEED_SESSION = 'seed-session-test-001';
 
 async function seed() {
   console.log('Seeding waiting items...');
@@ -92,7 +104,7 @@ async function seed() {
   // Thread 1: permission item
   const p1 = await post('/api/waiting', {
     thread_id: SEED_THREAD_1,
-    session_id: SEED_SESSION,
+    session_id: 'seed-session-test-001',
     kind: 'permission',
     context: {
       tool_name: 'Bash',
@@ -104,13 +116,13 @@ async function seed() {
   });
   console.log('Created permission item:', p1.id);
 
-  // Thread 1: question item (same thread, different session showing history)
+  // Thread 1: question item (same thread)
   const q1 = await post('/api/waiting', {
     thread_id: SEED_THREAD_1,
-    session_id: 'seed-session-prev-000',
+    session_id: 'seed-session-test-001',
     kind: 'question',
     context: {
-      message: 'I\'ve found two approaches for the schema migration. Option A: add a nullable column and backfill. Option B: create a new table and join. Which do you prefer?',
+      message: "I've found two approaches for the schema migration. Option A: add a nullable column and backfill. Option B: create a new table and join. Which do you prefer?",
       agent_name: 'boris',
       project: 'agent-queue',
     },
@@ -131,24 +143,12 @@ async function seed() {
   console.log('Created done item:', d1.id);
 
   console.log('\nSeeded 3 items across 2 threads.');
-  console.log('IDs:', [p1.id, q1.id, d1.id].join(', '));
+  console.log('View at: https://agent-queue.vercel.app/waiting');
   return [p1.id, q1.id, d1.id];
 }
 
-async function clean(ids) {
-  console.log('Cleaning up seeded items...');
-  for (const id of ids) {
-    try {
-      await patch(id, { status: 'expired' });
-      console.log('Expired:', id);
-    } catch (e) {
-      console.log('Could not expire', id, '—', e.message);
-    }
-  }
-}
-
 async function cleanAll() {
-  // Find all waiting items with our seed thread IDs
+  console.log('Cleaning up seeded items...');
   const data = await getWaiting();
   const seedItems = (data.items || []).filter(
     i => i.thread_id === SEED_THREAD_1 || i.thread_id === SEED_THREAD_2
@@ -157,13 +157,19 @@ async function cleanAll() {
     console.log('No seed items found to clean.');
     return;
   }
-  await clean(seedItems.map(i => i.id));
+  for (const item of seedItems) {
+    try {
+      await patchItem(item.id, { status: 'expired' });
+      console.log('Expired:', item.id);
+    } catch (e) {
+      console.log('Could not expire', item.id, '-', e.message);
+    }
+  }
 }
 
 const doClean = process.argv.includes('--clean');
 
-if (doClean) {
-  cleanAll().catch(err => { console.error(err); process.exit(1); });
-} else {
-  seed().catch(err => { console.error(err); process.exit(1); });
-}
+(doClean ? cleanAll() : seed()).catch(err => {
+  console.error(err.message);
+  process.exit(1);
+});
