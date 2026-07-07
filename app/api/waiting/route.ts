@@ -102,12 +102,26 @@ function buildPushPayload(kind: string, context: Record<string, unknown>) {
 
 // GET /api/waiting — phone lists open + recent items. Cookie or Bearer auth.
 // Bearer is accepted so the local answer-dispatcher can poll for answered items.
+// Server-side auto-expiry: permission items older than 6 minutes are expired here
+// before the SELECT, so stale Allow/Deny buttons never surface on the phone.
 export async function GET(req: Request) {
   if (!await validateAuth(req)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   const sql = getDb();
+
+  // Auto-expire stale permission items before fetching.
+  // Only affects kind=permission, status=waiting, created > 6 minutes ago.
+  // question/done items are not touched — they have no answering deadline.
+  await sql`
+    UPDATE waiting_items
+    SET status = 'expired', answered_at = NOW()
+    WHERE kind = 'permission'
+      AND status = 'waiting'
+      AND created_at < NOW() - INTERVAL '6 minutes'
+  `;
+
   // Return: all 'waiting' items + items answered/expired in the last 24h
   const items = await sql`
     SELECT id, thread_id, session_id, kind, context, status, answer, created_at, answered_at

@@ -218,6 +218,46 @@ function formatInput(input: string | Record<string, unknown> | undefined): strin
 }
 
 // ---------------------------------------------------------------------------
+// Answer-window hint for permission items.
+// Permission items are answerable for ~5 min (hook-gate polls 5 min, server
+// auto-expires at 6 min). Show remaining time or "expiring soon" below 90s.
+// ---------------------------------------------------------------------------
+
+function AnswerWindowHint({ createdAt }: { createdAt: string }) {
+  const [hint, setHint] = useState<string>('');
+
+  useEffect(() => {
+    function compute() {
+      const ageMs = Date.now() - new Date(createdAt).getTime();
+      const ageS = Math.floor(ageMs / 1000);
+      // Hook-gate answers within 5 min; server expires at 6 min.
+      const windowS = 5 * 60; // 300s answerable window
+      const remaining = windowS - ageS;
+      if (remaining <= 0) {
+        setHint('expiring…');
+      } else if (remaining < 90) {
+        setHint(`expiring in ${remaining}s`);
+      } else {
+        const remMin = Math.ceil(remaining / 60);
+        setHint(`~${remMin}m left to answer`);
+      }
+    }
+    compute();
+    const t = setInterval(compute, 10000);
+    return () => clearInterval(t);
+  }, [createdAt]);
+
+  const ageS = Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000);
+  const urgent = (5 * 60 - ageS) < 90;
+
+  return (
+    <span className={urgent ? 'answer-hint answer-hint-urgent' : 'answer-hint'}>
+      {hint}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Permission item
 // ---------------------------------------------------------------------------
 
@@ -230,8 +270,10 @@ function PermissionItem({
   onAnswer: (id: string, decision: 'allow' | 'deny') => Promise<void>;
   answering: string | null;
 }) {
-  const { tool_name, tool_input, agent_name, project, cwd } = item.context;
+  const { tool_name, tool_input, agent_name, project, cwd, message } = item.context;
   const isAnswering = answering === item.id;
+  // Use structured tool fields when present; fall back to context.message.
+  const hasStructured = !!(tool_name || tool_input);
 
   return (
     <div className="item-card item-permission">
@@ -242,23 +284,38 @@ function PermissionItem({
         <span className="item-time">{timeAgo(item.created_at)}</span>
       </div>
 
-      {tool_name && (
+      {/* Structured display: hook-gate and away-mode items that carry tool_name/tool_input */}
+      {hasStructured && tool_name && (
         <div className="tool-row">
           <span className="tool-label">Tool</span>
           <code className="tool-name">{tool_name}</code>
         </div>
       )}
-
-      {tool_input && (
+      {hasStructured && tool_input && (
         <pre className="input-block">{formatInput(tool_input)}</pre>
       )}
-
-      {cwd && (
+      {hasStructured && cwd && (
         <div className="cwd-row">
           <span className="cwd-label">cwd</span>
           <code className="cwd-value">{typeof cwd === 'string' ? cwd : String(cwd)}</code>
         </div>
       )}
+
+      {/* Fallback: desktop-notifier items that only carry context.message */}
+      {!hasStructured && message && (
+        <p className="permission-message">{String(message)}</p>
+      )}
+      {/* Show cwd even in fallback mode if present */}
+      {!hasStructured && cwd && (
+        <div className="cwd-row">
+          <span className="cwd-label">cwd</span>
+          <code className="cwd-value">{typeof cwd === 'string' ? cwd : String(cwd)}</code>
+        </div>
+      )}
+
+      <div className="answer-window-row">
+        <AnswerWindowHint createdAt={item.created_at} />
+      </div>
 
       <div className="action-row">
         <button
@@ -388,6 +445,31 @@ function HistoryItem({ item }: { item: WaitingItem }) {
 // Thread group
 // ---------------------------------------------------------------------------
 
+// Build a human-readable thread label.
+// thread_id is either "session:<id>" (from hook-gate) or a raw UUID.
+// Prefer agent/project from the most recent item's context if available.
+function threadLabel(group: ThreadGroup): { short: string; label: string | null } {
+  // Strip the "session:" prefix to get the raw id
+  const rawId = group.thread_id.startsWith('session:')
+    ? group.thread_id.slice('session:'.length)
+    : group.thread_id;
+  const short = rawId.slice(0, 8);
+
+  // Pull agent/project from the first item that has them (newest first)
+  let label: string | null = null;
+  for (const item of group.items) {
+    const { agent_name, project } = item.context;
+    if (agent_name || project) {
+      const parts: string[] = [];
+      if (agent_name) parts.push(String(agent_name));
+      if (project) parts.push(String(project));
+      label = parts.join(' / ');
+      break;
+    }
+  }
+  return { short, label };
+}
+
 function Thread({
   group,
   onAnswer,
@@ -401,11 +483,13 @@ function Thread({
 }) {
   const active = group.items.filter(i => i.status === 'waiting');
   const history = group.items.filter(i => i.status !== 'waiting');
+  const { short, label } = threadLabel(group);
 
   return (
     <div className="thread">
       <div className="thread-header">
-        <span className="thread-id">thread {shortId(group.thread_id)}</span>
+        <span className="thread-id">{short}</span>
+        {label && <span className="thread-label">{label}</span>}
         {active.length > 0 && (
           <span className="thread-badge">{active.length} waiting</span>
         )}
@@ -630,7 +714,11 @@ export default function WaitingPage() {
         }
         .thread-id {
           font-size: 0.7rem; font-family: 'SF Mono', 'Cascadia Code', monospace;
-          color: #555; letter-spacing: 0.03em;
+          color: #555; letter-spacing: 0.03em; flex-shrink: 0;
+        }
+        .thread-label {
+          font-size: 0.7rem; color: #4a4a4a; letter-spacing: 0.01em;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
         }
         .thread-badge {
           font-size: 0.65rem; font-weight: 700;
@@ -690,6 +778,23 @@ export default function WaitingPage() {
         }
         .cwd-label { font-size: 0.65rem; color: #444; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
         .cwd-value { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.7rem; color: #555; word-break: break-all; }
+
+        /* Permission message fallback (when tool_name/tool_input absent) */
+        .permission-message {
+          font-size: 0.88rem; color: #ccc; line-height: 1.5;
+          margin-bottom: 0.5rem; white-space: pre-wrap;
+        }
+
+        /* Answer-window hint */
+        .answer-window-row {
+          margin-bottom: 0.5rem;
+        }
+        .answer-hint {
+          font-size: 0.7rem; color: #555;
+        }
+        .answer-hint-urgent {
+          color: #f59e0b; font-weight: 600;
+        }
 
         /* Question / done text */
         .question-text {
