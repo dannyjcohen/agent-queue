@@ -1,5 +1,5 @@
 import { getDb } from '../../../lib/db';
-import { validateBearer, validateCookie } from '../../../lib/auth';
+import { validateBearer, validateCookie, validateAuth } from '../../../lib/auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -42,9 +42,10 @@ export async function POST(req: Request) {
   return Response.json(rows[0], { status: 201 });
 }
 
-// GET /api/waiting — phone lists open + recent items. Cookie auth only.
+// GET /api/waiting — phone lists open + recent items. Cookie or Bearer auth.
+// Bearer is accepted so the local answer-dispatcher can poll for answered items.
 export async function GET(req: Request) {
-  if (!await validateCookie(req)) {
+  if (!await validateAuth(req)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
