@@ -3,6 +3,139 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 // ---------------------------------------------------------------------------
+// VAPID URL base64 → Uint8Array conversion for push subscription
+// ---------------------------------------------------------------------------
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
+// ---------------------------------------------------------------------------
+// NotificationsButton — manages push subscription state
+// ---------------------------------------------------------------------------
+function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) => void }) {
+  const [permission, setPermission] = useState<NotificationPermission>('default');
+  const [subscribed, setSubscribed] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  // On mount: read current permission + check if already subscribed
+  useEffect(() => {
+    if (!('Notification' in window) || !('serviceWorker' in navigator)) return;
+    setPermission(Notification.permission);
+    if (Notification.permission === 'granted') {
+      navigator.serviceWorker.ready.then((reg) => {
+        reg.pushManager.getSubscription().then((sub) => {
+          setSubscribed(!!sub);
+        });
+      });
+    }
+  }, []);
+
+  const handleClick = useCallback(async () => {
+    if (!('Notification' in window)) {
+      onToast('Notifications not supported in this browser.', false);
+      return;
+    }
+    if (!('serviceWorker' in navigator)) {
+      onToast('Service workers not supported.', false);
+      return;
+    }
+
+    setWorking(true);
+    try {
+      // 1. Request permission
+      const perm = await Notification.requestPermission();
+      setPermission(perm);
+      if (perm !== 'granted') {
+        onToast('Notification permission denied.', false);
+        return;
+      }
+
+      // 2. Fetch VAPID public key
+      const keyRes = await fetch('/api/push/vapid-public-key');
+      if (!keyRes.ok) {
+        onToast('Push not configured on server.', false);
+        return;
+      }
+      const { publicKey } = await keyRes.json() as { publicKey: string };
+
+      // 3. Subscribe via service worker
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+
+      // 4. Send subscription to backend
+      const res = await fetch('/api/push/subscribe', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sub.toJSON()),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({})) as { error?: string };
+        onToast(d.error ?? `Subscribe failed: ${res.status}`, false);
+        return;
+      }
+
+      setSubscribed(true);
+      onToast('Notifications enabled.', true);
+    } catch (err) {
+      onToast(`Error: ${(err as Error).message}`, false);
+    } finally {
+      setWorking(false);
+    }
+  }, [onToast]);
+
+  // Don't render if push API is not available (non-SW browsers, HTTP)
+  if (typeof window !== 'undefined' && !('serviceWorker' in navigator)) return null;
+
+  if (permission === 'denied') {
+    return (
+      <span style={{ fontSize: '0.7rem', color: '#4a4a4a' }} title="Notifications blocked in browser settings">
+        notif blocked
+      </span>
+    );
+  }
+
+  if (subscribed && permission === 'granted') {
+    return (
+      <span style={{ fontSize: '0.72rem', color: '#16a34a' }} title="Push notifications active">
+        notif on
+      </span>
+    );
+  }
+
+  return (
+    <button
+      onClick={handleClick}
+      disabled={working}
+      style={{
+        background: 'none',
+        border: '1px solid #2a2a2a',
+        borderRadius: '6px',
+        color: '#888',
+        fontSize: '0.72rem',
+        padding: '0.2rem 0.55rem',
+        cursor: working ? 'not-allowed' : 'pointer',
+        opacity: working ? 0.5 : 1,
+        whiteSpace: 'nowrap',
+      }}
+      title="Enable push notifications"
+    >
+      {working ? '…' : 'Enable notif'}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -679,7 +812,7 @@ export default function WaitingPage() {
           <span className="header-title">Agent Queue</span>
           <div className="header-right">
             <div className="header-actions">
-              {/* Task 389: PWA/notifications button will be inserted here */}
+              <NotificationsButton onToast={showToast} />
             </div>
             {waitingCount > 0 && (
               <span className="waiting-count">{waitingCount}</span>

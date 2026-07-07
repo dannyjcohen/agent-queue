@@ -27,3 +27,15 @@ CREATE TABLE IF NOT EXISTS waiting_items (
 );
 CREATE INDEX IF NOT EXISTS idx_waiting_items_status ON waiting_items(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_waiting_items_thread ON waiting_items(thread_id, created_at);
+
+-- Web push subscriptions (task 389)
+-- One row per browser subscription endpoint. Pruned automatically on 404/410 from the push service.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  endpoint        TEXT NOT NULL UNIQUE,
+  p256dh          TEXT NOT NULL,
+  auth            TEXT NOT NULL,
+  expiration_time BIGINT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

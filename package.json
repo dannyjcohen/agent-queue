@@ -12,12 +12,14 @@
     "@types/bcryptjs": "^2.4.6",
     "bcryptjs": "^3.0.3",
     "jose": "^6.2.3",
-    "next": "^16.2.9"
+    "next": "^16.2.9",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/react": "18.3.31",
     "@types/react-dom": "^18",
+    "@types/web-push": "^3.6.4",
     "typescript": "5.9.3"
   }
 }

@@ -1,5 +1,6 @@
 import { getDb } from '../../../lib/db';
 import { validateBearer, validateCookie, validateAuth } from '../../../lib/auth';
+import { sendPushToAll } from '../../../lib/push';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,11 +17,12 @@ export async function POST(req: Request) {
     return Response.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const { thread_id, session_id, kind, context = {} } = body as {
+  const { thread_id, session_id, kind, context = {}, notify = false } = body as {
     thread_id?: string;
     session_id?: string;
     kind?: string;
     context?: Record<string, unknown>;
+    notify?: boolean;
   };
 
   if (!thread_id || typeof thread_id !== 'string' || !thread_id.trim()) {
@@ -39,7 +41,63 @@ export async function POST(req: Request) {
     VALUES (${thread_id}, ${session_id}, ${kind}, ${JSON.stringify(context)})
     RETURNING id, thread_id, session_id, kind, context, status, created_at
   `;
-  return Response.json(rows[0], { status: 201 });
+  const item = rows[0];
+
+  // Fire web push if requested. Wrapped in try/catch so a push failure never
+  // breaks item creation — the item is already in the DB at this point.
+  if (notify) {
+    try {
+      const pushPayload = buildPushPayload(kind as string, context as Record<string, unknown>);
+      await sendPushToAll(pushPayload);
+    } catch (err) {
+      // Log but do not surface to caller
+      console.warn('[waiting POST] push send failed:', (err as Error).message);
+    }
+  }
+
+  return Response.json(item, { status: 201 });
+}
+
+// ---------------------------------------------------------------------------
+// Build a notification payload from the waiting item.
+// Title/body summarize the item. No full tool inputs in the body (can be large).
+// ---------------------------------------------------------------------------
+function buildPushPayload(kind: string, context: Record<string, unknown>) {
+  const agent = typeof context.agent_name === 'string' ? context.agent_name : null;
+  const project = typeof context.project === 'string' ? context.project : null;
+
+  let title = 'Agent Queue — action needed';
+  let body = 'Claude is waiting for your input.';
+
+  if (kind === 'permission') {
+    const tool = typeof context.tool_name === 'string' ? context.tool_name : 'a tool';
+    title = 'Permission request';
+    const parts: string[] = [`${tool} call`];
+    if (agent) parts.push(`from ${agent}`);
+    if (project) parts.push(`on ${project}`);
+    body = parts.join(' ');
+  } else if (kind === 'question') {
+    title = 'Question from Claude';
+    const msg =
+      typeof context.message === 'string' ? context.message :
+      typeof context.question === 'string' ? context.question : null;
+    if (msg) {
+      // First 120 chars, no newlines
+      body = msg.replace(/\n+/g, ' ').slice(0, 120) + (msg.length > 120 ? '…' : '');
+    } else if (agent) {
+      body = `${agent} has a question`;
+    }
+  } else if (kind === 'done') {
+    title = 'Task complete';
+    const summary = typeof context.summary === 'string' ? context.summary : null;
+    if (summary) {
+      body = summary.replace(/\n+/g, ' ').slice(0, 120) + (summary.length > 120 ? '…' : '');
+    } else if (agent) {
+      body = `${agent} finished`;
+    }
+  }
+
+  return { title, body, url: '/waiting', tag: 'agent-queue-waiting' };
 }
 
 // GET /api/waiting — phone lists open + recent items. Cookie or Bearer auth.
