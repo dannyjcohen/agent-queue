@@ -7,7 +7,7 @@ export async function PATCH(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  if (!validateAuth(req)) {
+  if (!await validateAuth(req)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
   const { id } = await params;

@@ -10,7 +10,8 @@ import { getDb } from '../../../../lib/db';
 export const dynamic = 'force-dynamic';
 
 // Only these trigger types result in a queue item being inserted.
-const PROCESSED_TRIGGER_TYPES = new Set(['firstException', 'reoccurrence']);
+// 'exception' is sent by BugSnag for handled errors and some notification rule configs.
+const PROCESSED_TRIGGER_TYPES = new Set(['firstException', 'reoccurrence', 'exception']);
 
 // Valid project types accepted via ?project= query param.
 const VALID_PROJECT_TYPES = new Set(['frontend', 'backend']);
@@ -54,28 +55,34 @@ function formatStackTrace(frames: BugSnagStackFrame[] | undefined): string {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  const tag = `[bugsnag-webhook ${new Date().toISOString()}]`;
+
   // --- Auth ---
   const secret = process.env.BUGSNAG_WEBHOOK_SECRET;
   if (!secret) {
+    console.error(`${tag} BUGSNAG_WEBHOOK_SECRET not configured`);
     return Response.json({ error: 'BUGSNAG_WEBHOOK_SECRET is not configured' }, { status: 500 });
   }
 
   const url = new URL(req.url);
   const authHeader = req.headers.get('authorization');
   const secretParam = url.searchParams.get('secret');
+  const projectParam = url.searchParams.get('project');
+
+  console.log(`${tag} incoming POST — project=${projectParam} hasAuthHeader=${!!authHeader} hasSecretParam=${!!secretParam}`);
 
   const authorized =
     authHeader === `Bearer ${secret}` || secretParam === secret;
 
   if (!authorized) {
-    // Return 200 to prevent BugSnag retries on auth failures (misconfiguration).
+    console.warn(`${tag} auth failed — returning 200 to suppress BugSnag retries`);
     return Response.json({ error: 'Unauthorized' }, { status: 200 });
   }
 
   // --- ?project= param ---
   const projectType = url.searchParams.get('project');
   if (!projectType || !VALID_PROJECT_TYPES.has(projectType)) {
-    // Missing or invalid config — return 200 so BugSnag does not retry endlessly.
+    console.warn(`${tag} invalid/missing project param: ${projectType}`);
     return Response.json({ error: 'missing or invalid project param' }, { status: 200 });
   }
 
@@ -83,16 +90,20 @@ export async function POST(req: Request): Promise<Response> {
   let body: BugSnagPayload = {};
   try {
     body = await req.json();
-  } catch {
+  } catch (err) {
+    console.error(`${tag} JSON parse failed:`, err);
     return Response.json({ error: 'invalid JSON body' }, { status: 200 });
   }
 
   const { trigger, error, project, exceptions } = body;
 
   // --- Trigger filtering ---
-  const triggerType = trigger?.type ?? '';
+  const triggerType = trigger?.type ?? '(missing)';
+  console.log(`${tag} trigger=${triggerType} errorClass=${error?.exceptionClass ?? '(none)'} errorId=${error?.errorId ?? '(none)'} releaseStage=${error?.app?.releaseStage ?? '(none)'}`);
+
   if (!PROCESSED_TRIGGER_TYPES.has(triggerType)) {
-    return Response.json({ skipped: true }, { status: 200 });
+    console.log(`${tag} skipping — trigger type not in processed set`);
+    return Response.json({ skipped: true, trigger: triggerType }, { status: 200 });
   }
 
   // --- Build stack trace string ---
@@ -114,12 +125,17 @@ export async function POST(req: Request): Promise<Response> {
   };
 
   // --- Insert into queue ---
-  const sql = getDb();
-  const rows = await sql`
-    INSERT INTO queue_items (type, source, payload)
-    VALUES (${'bugsnag-alert'}, ${'bugsnag'}, ${JSON.stringify(payload)})
-    RETURNING id, type, source, status, created_at
-  `;
-
-  return Response.json({ queued: true, id: rows[0].id }, { status: 201 });
+  try {
+    const sql = getDb();
+    const rows = await sql`
+      INSERT INTO queue_items (type, source, payload)
+      VALUES (${'bugsnag-alert'}, ${'bugsnag'}, ${JSON.stringify(payload)})
+      RETURNING id, type, source, status, created_at
+    `;
+    console.log(`${tag} queued — id=${rows[0].id} errorId=${payload.error_group_id}`);
+    return Response.json({ queued: true, id: rows[0].id }, { status: 201 });
+  } catch (err) {
+    console.error(`${tag} DB insert failed:`, err);
+    return Response.json({ error: 'queue insert failed' }, { status: 500 });
+  }
 }

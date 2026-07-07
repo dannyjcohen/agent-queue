@@ -4,7 +4,7 @@ import { validateAuth } from '../../../lib/auth';
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
-  if (!validateAuth(req)) {
+  if (!await validateAuth(req)) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
   let body: Record<string, unknown> = {};
