@@ -24,7 +24,6 @@ function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) 
   const [subscribed, setSubscribed] = useState(false);
   const [working, setWorking] = useState(false);
 
-  // On mount: read current permission + check if already subscribed
   useEffect(() => {
     if (!('Notification' in window) || !('serviceWorker' in navigator)) return;
     setPermission(Notification.permission);
@@ -49,7 +48,6 @@ function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) 
 
     setWorking(true);
     try {
-      // 1. Request permission
       const perm = await Notification.requestPermission();
       setPermission(perm);
       if (perm !== 'granted') {
@@ -57,7 +55,6 @@ function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) 
         return;
       }
 
-      // 2. Fetch VAPID public key
       const keyRes = await fetch('/api/push/vapid-public-key');
       if (!keyRes.ok) {
         onToast('Push not configured on server.', false);
@@ -65,14 +62,12 @@ function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) 
       }
       const { publicKey } = await keyRes.json() as { publicKey: string };
 
-      // 3. Subscribe via service worker
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(publicKey),
       });
 
-      // 4. Send subscription to backend
       const res = await fetch('/api/push/subscribe', {
         method: 'POST',
         credentials: 'include',
@@ -94,7 +89,6 @@ function NotificationsButton({ onToast }: { onToast: (msg: string, ok: boolean) 
     }
   }, [onToast]);
 
-  // Don't render if push API is not available (non-SW browsers, HTTP)
   if (typeof window !== 'undefined' && !('serviceWorker' in navigator)) return null;
 
   if (permission === 'denied') {
@@ -145,16 +139,19 @@ interface WaitingItem {
   session_id: string;
   kind: 'permission' | 'question' | 'done';
   context: {
-    // permission
+    // permission (hook-gate)
     tool_name?: string;
     tool_input?: string | Record<string, unknown>;
-    agent_name?: string;
-    project?: string;
     cwd?: string;
-    // question / done
+    // question / done — new contract from task 425
+    last_message?: string;
+    // older items / fallbacks
     message?: string;
     question?: string;
     summary?: string;
+    // identity — task 425 populates these
+    agent_name?: string;
+    project?: string;
   };
   status: 'waiting' | 'answered' | 'answered_locally' | 'expired';
   answer: { decision?: string; text?: string } | null;
@@ -162,9 +159,14 @@ interface WaitingItem {
   answered_at: string | null;
 }
 
-interface ThreadGroup {
+interface SessionGroup {
   thread_id: string;
+  /** All items newest-first */
   items: WaitingItem[];
+  /** The single open (waiting) item, or null */
+  openItem: WaitingItem | null;
+  /** Resolved items for history */
+  historyItems: WaitingItem[];
   latestCreated: number;
 }
 
@@ -172,27 +174,38 @@ interface ThreadGroup {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function groupByThread(items: WaitingItem[]): ThreadGroup[] {
+function groupBySession(items: WaitingItem[]): SessionGroup[] {
   const map = new Map<string, WaitingItem[]>();
   for (const item of items) {
     const list = map.get(item.thread_id) ?? [];
     list.push(item);
     map.set(item.thread_id, list);
   }
-  // Each thread: sort items newest first
-  const groups: ThreadGroup[] = [];
+
+  const groups: SessionGroup[] = [];
   for (const [thread_id, list] of map.entries()) {
     const sorted = [...list].sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
+    // Latest waiting item only (there should only ever be one after task 425 fix,
+    // but defensively take the newest)
+    const openItem = sorted.find(i => i.status === 'waiting') ?? null;
+    const historyItems = sorted.filter(i => i.status !== 'waiting');
     groups.push({
       thread_id,
       items: sorted,
+      openItem,
+      historyItems,
       latestCreated: new Date(sorted[0].created_at).getTime(),
     });
   }
-  // Sort thread groups newest first
-  return groups.sort((a, b) => b.latestCreated - a.latestCreated);
+  // Sort: sessions with open items first (newest first), then resolved sessions
+  return groups.sort((a, b) => {
+    const aOpen = a.openItem !== null ? 1 : 0;
+    const bOpen = b.openItem !== null ? 1 : 0;
+    if (aOpen !== bOpen) return bOpen - aOpen;
+    return b.latestCreated - a.latestCreated;
+  });
 }
 
 function timeAgo(iso: string): string {
@@ -204,7 +217,31 @@ function timeAgo(iso: string): string {
 }
 
 function shortId(id: string): string {
-  return id.slice(0, 8);
+  // Strip "session:" prefix if present
+  const raw = id.startsWith('session:') ? id.slice('session:'.length) : id;
+  return raw.slice(0, 8);
+}
+
+function sessionTitle(thread_id: string, items: WaitingItem[]): string {
+  // Pull agent_name + project from the most recent item that has them
+  for (const item of items) {
+    const { agent_name, project } = item.context;
+    if (agent_name || project) {
+      const parts: string[] = [];
+      if (agent_name) parts.push(String(agent_name));
+      if (project) parts.push(String(project));
+      return parts.join(' / ');
+    }
+  }
+  // Fallback: 8-char session id
+  return shortId(thread_id);
+}
+
+function kindLabel(kind: WaitingItem['kind']): string {
+  if (kind === 'permission') return 'Needs permission';
+  if (kind === 'question') return 'Question';
+  if (kind === 'done') return 'Finished — waiting for next instruction';
+  return kind;
 }
 
 function formatInput(input: string | Record<string, unknown> | undefined): string {
@@ -219,8 +256,6 @@ function formatInput(input: string | Record<string, unknown> | undefined): strin
 
 // ---------------------------------------------------------------------------
 // Answer-window hint for permission items.
-// Permission items are answerable for ~5 min (hook-gate polls 5 min, server
-// auto-expires at 6 min). Show remaining time or "expiring soon" below 90s.
 // ---------------------------------------------------------------------------
 
 function AnswerWindowHint({ createdAt }: { createdAt: string }) {
@@ -230,8 +265,7 @@ function AnswerWindowHint({ createdAt }: { createdAt: string }) {
     function compute() {
       const ageMs = Date.now() - new Date(createdAt).getTime();
       const ageS = Math.floor(ageMs / 1000);
-      // Hook-gate answers within 5 min; server expires at 6 min.
-      const windowS = 5 * 60; // 300s answerable window
+      const windowS = 5 * 60;
       const remaining = windowS - ageS;
       if (remaining <= 0) {
         setHint('expiring…');
@@ -258,10 +292,10 @@ function AnswerWindowHint({ createdAt }: { createdAt: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Permission item
+// Permission card
 // ---------------------------------------------------------------------------
 
-function PermissionItem({
+function PermissionCard({
   item,
   onAnswer,
   answering,
@@ -270,21 +304,12 @@ function PermissionItem({
   onAnswer: (id: string, decision: 'allow' | 'deny') => Promise<void>;
   answering: string | null;
 }) {
-  const { tool_name, tool_input, agent_name, project, cwd, message } = item.context;
+  const { tool_name, tool_input, cwd, message } = item.context;
   const isAnswering = answering === item.id;
-  // Use structured tool fields when present; fall back to context.message.
   const hasStructured = !!(tool_name || tool_input);
 
   return (
-    <div className="item-card item-permission">
-      <div className="item-meta">
-        <span className="kind-badge kind-permission">permission</span>
-        {agent_name && <span className="meta-chip">{agent_name}</span>}
-        {project && <span className="meta-chip">{project}</span>}
-        <span className="item-time">{timeAgo(item.created_at)}</span>
-      </div>
-
-      {/* Structured display: hook-gate and away-mode items that carry tool_name/tool_input */}
+    <div className="card-body">
       {hasStructured && tool_name && (
         <div className="tool-row">
           <span className="tool-label">Tool</span>
@@ -301,11 +326,10 @@ function PermissionItem({
         </div>
       )}
 
-      {/* Fallback: desktop-notifier items that only carry context.message */}
+      {/* Fallback: no tool_name/tool_input — show context.message */}
       {!hasStructured && message && (
-        <p className="permission-message">{String(message)}</p>
+        <p className="message-text">{String(message)}</p>
       )}
-      {/* Show cwd even in fallback mode if present */}
       {!hasStructured && cwd && (
         <div className="cwd-row">
           <span className="cwd-label">cwd</span>
@@ -338,10 +362,10 @@ function PermissionItem({
 }
 
 // ---------------------------------------------------------------------------
-// Question / done item
+// Question / done card
 // ---------------------------------------------------------------------------
 
-function QuestionItem({
+function QuestionCard({
   item,
   onAnswer,
   answering,
@@ -352,19 +376,18 @@ function QuestionItem({
 }) {
   const [reply, setReply] = useState('');
   const isAnswering = answering === item.id;
-  const text = item.context.message ?? item.context.question ?? item.context.summary ?? '';
-  const { agent_name, project } = item.context;
+  // Prefer context.last_message (new contract from task 425),
+  // fall back to older fields
+  const text =
+    item.context.last_message ??
+    item.context.message ??
+    item.context.question ??
+    item.context.summary ??
+    '';
 
   return (
-    <div className="item-card item-question">
-      <div className="item-meta">
-        <span className={`kind-badge kind-${item.kind}`}>{item.kind}</span>
-        {agent_name && <span className="meta-chip">{agent_name}</span>}
-        {project && <span className="meta-chip">{project}</span>}
-        <span className="item-time">{timeAgo(item.created_at)}</span>
-      </div>
-
-      {text && <p className="question-text">{text}</p>}
+    <div className="card-body">
+      {text && <p className="message-text">{text}</p>}
 
       <div className="reply-row">
         <textarea
@@ -393,11 +416,39 @@ function QuestionItem({
 }
 
 // ---------------------------------------------------------------------------
-// Answered / history item (collapsed, muted)
+// History expander — collapsed by default, per session card
 // ---------------------------------------------------------------------------
 
-function HistoryItem({ item }: { item: WaitingItem }) {
+function HistoryExpander({ items }: { items: WaitingItem[] }) {
+  const [open, setOpen] = useState(false);
+
+  if (items.length === 0) return null;
+
+  return (
+    <div className="history-expander">
+      <button
+        className="history-toggle-btn"
+        onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
+      >
+        <span>history ({items.length})</span>
+        <span className="history-chevron">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div className="history-list">
+          {items.map(item => (
+            <HistoryRow key={item.id} item={item} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryRow({ item }: { item: WaitingItem }) {
   const [expanded, setExpanded] = useState(false);
+
   const statusLabel =
     item.status === 'answered_locally'
       ? 'answered locally'
@@ -405,29 +456,23 @@ function HistoryItem({ item }: { item: WaitingItem }) {
       ? 'expired'
       : 'answered';
 
-  const kindLabel = item.kind;
-  const { tool_name, message, question, summary } = item.context;
-  const preview = tool_name ?? message ?? question ?? summary ?? item.kind;
+  const { tool_name, last_message, message, question, summary } = item.context;
+  const preview = tool_name ?? last_message ?? message ?? question ?? summary ?? item.kind;
 
   return (
-    <div className="history-item" onClick={() => setExpanded(v => !v)}>
-      <div className="history-header">
+    <div className="history-row" onClick={() => setExpanded(v => !v)}>
+      <div className="history-row-header">
         <span className="history-preview">{String(preview).slice(0, 60)}</span>
-        <span className="history-status">{statusLabel}</span>
+        <span className="history-status-chip">{statusLabel}</span>
         <span className="history-time">{timeAgo(item.created_at)}</span>
-        <span className="history-toggle">{expanded ? '▲' : '▼'}</span>
+        <span className="history-row-chevron">{expanded ? '▲' : '▼'}</span>
       </div>
       {expanded && (
-        <div className="history-detail">
-          <div className="history-meta">
-            <span className="kind-badge-sm">{kindLabel}</span>
-            {item.context.agent_name && (
-              <span className="meta-chip-sm">{item.context.agent_name}</span>
-            )}
-          </div>
+        <div className="history-row-detail">
+          <span className="kind-badge-sm kind-sm-{item.kind}">{kindLabel(item.kind)}</span>
           {item.answer && (
             <div className="history-answer">
-              <span className="history-answer-label">Answer:</span>{' '}
+              <span className="history-answer-label">Answer: </span>
               {item.answer.decision
                 ? item.answer.decision
                 : item.answer.text
@@ -442,83 +487,67 @@ function HistoryItem({ item }: { item: WaitingItem }) {
 }
 
 // ---------------------------------------------------------------------------
-// Thread group
+// Session card — one per thread, shows only the latest open item
 // ---------------------------------------------------------------------------
 
-// Build a human-readable thread label.
-// thread_id is either "session:<id>" (from hook-gate) or a raw UUID.
-// Prefer agent/project from the most recent item's context if available.
-function threadLabel(group: ThreadGroup): { short: string; label: string | null } {
-  // Strip the "session:" prefix to get the raw id
-  const rawId = group.thread_id.startsWith('session:')
-    ? group.thread_id.slice('session:'.length)
-    : group.thread_id;
-  const short = rawId.slice(0, 8);
-
-  // Pull agent/project from the first item that has them (newest first)
-  let label: string | null = null;
-  for (const item of group.items) {
-    const { agent_name, project } = item.context;
-    if (agent_name || project) {
-      const parts: string[] = [];
-      if (agent_name) parts.push(String(agent_name));
-      if (project) parts.push(String(project));
-      label = parts.join(' / ');
-      break;
-    }
-  }
-  return { short, label };
-}
-
-function Thread({
+function SessionCard({
   group,
-  onAnswer,
-  answering,
+  onPermissionAnswer,
   onQuestionAnswer,
+  answering,
 }: {
-  group: ThreadGroup;
-  onAnswer: (id: string, decision: 'allow' | 'deny') => Promise<void>;
+  group: SessionGroup;
+  onPermissionAnswer: (id: string, decision: 'allow' | 'deny') => Promise<void>;
   onQuestionAnswer: (id: string, text: string) => Promise<void>;
   answering: string | null;
 }) {
-  const active = group.items.filter(i => i.status === 'waiting');
-  const history = group.items.filter(i => i.status !== 'waiting');
-  const { short, label } = threadLabel(group);
+  const { thread_id, items, openItem, historyItems } = group;
+  const title = sessionTitle(thread_id, items);
+  const hasRealTitle =
+    items.some(i => i.context.agent_name || i.context.project);
 
   return (
-    <div className="thread">
-      <div className="thread-header">
-        <span className="thread-id">{short}</span>
-        {label && <span className="thread-label">{label}</span>}
-        {active.length > 0 && (
-          <span className="thread-badge">{active.length} waiting</span>
-        )}
+    <div className="session-card">
+      {/* Card header: title + kind badge + time */}
+      <div className="card-header">
+        <div className="card-header-left">
+          {!hasRealTitle && (
+            <span className="session-id-chip">{shortId(thread_id)}</span>
+          )}
+          <span className="session-title">{title}</span>
+        </div>
+        <div className="card-header-right">
+          {openItem && (
+            <>
+              <span className={`kind-badge kind-${openItem.kind}`}>
+                {kindLabel(openItem.kind)}
+              </span>
+              <span className="item-time">{timeAgo(openItem.created_at)}</span>
+            </>
+          )}
+        </div>
       </div>
 
-      {active.map(item =>
-        item.kind === 'permission' ? (
-          <PermissionItem
-            key={item.id}
-            item={item}
-            onAnswer={onAnswer}
+      {/* Open item action area */}
+      {openItem && (
+        openItem.kind === 'permission' ? (
+          <PermissionCard
+            item={openItem}
+            onAnswer={onPermissionAnswer}
             answering={answering}
           />
         ) : (
-          <QuestionItem
-            key={item.id}
-            item={item}
+          <QuestionCard
+            item={openItem}
             onAnswer={onQuestionAnswer}
             answering={answering}
           />
         )
       )}
 
-      {history.length > 0 && (
-        <div className="history-section">
-          {history.map(item => (
-            <HistoryItem key={item.id} item={item} />
-          ))}
-        </div>
+      {/* History expander */}
+      {historyItems.length > 0 && (
+        <HistoryExpander items={historyItems} />
       )}
     </div>
   );
@@ -561,7 +590,7 @@ export default function WaitingPage() {
     }
   }, []);
 
-  // Initial fetch + polling
+  // Initial fetch + 5s polling with hidden-tab pause
   useEffect(() => {
     fetchItems();
 
@@ -657,8 +686,13 @@ export default function WaitingPage() {
     [fetchItems, showToast]
   );
 
-  const groups = groupByThread(items);
-  const waitingCount = items.filter(i => i.status === 'waiting').length;
+  const groups = groupBySession(items);
+  // Sessions with an open item
+  const openGroups = groups.filter(g => g.openItem !== null);
+  // Sessions that are fully resolved
+  const resolvedGroups = groups.filter(g => g.openItem === null);
+  // Badge = count of open items (one per open session)
+  const openCount = openGroups.length;
 
   return (
     <>
@@ -690,78 +724,77 @@ export default function WaitingPage() {
         .header-right {
           display: flex; align-items: center; gap: 0.5rem;
         }
-        .waiting-count {
+        .open-count {
           font-size: 0.75rem; font-weight: 600;
           background: #3b82f6; color: #fff;
           border-radius: 999px; padding: 0.1rem 0.5rem;
           min-width: 1.4rem; text-align: center;
         }
-        /* Placeholder for task 389: PWA/notifications button goes in .header-right */
         .header-actions { display: flex; align-items: center; gap: 0.4rem; }
 
-        /* ---- Thread ---- */
-        .thread {
-          margin-bottom: 1.25rem;
-          border: 1px solid #1e1e1e;
-          border-radius: 10px;
+        /* ---- Session card ---- */
+        .session-card {
+          margin-bottom: 1rem;
+          border: 1px solid #222;
+          border-radius: 12px;
           overflow: hidden;
-        }
-        .thread-header {
-          display: flex; align-items: center; gap: 0.5rem;
-          padding: 0.5rem 0.75rem;
           background: #141414;
+        }
+
+        /* Card header */
+        .card-header {
+          display: flex; align-items: flex-start; justify-content: space-between;
+          gap: 0.5rem;
+          padding: 0.75rem 0.9rem 0.6rem;
           border-bottom: 1px solid #1e1e1e;
+          background: #111;
         }
-        .thread-id {
-          font-size: 0.7rem; font-family: 'SF Mono', 'Cascadia Code', monospace;
-          color: #555; letter-spacing: 0.03em; flex-shrink: 0;
+        .card-header-left {
+          display: flex; align-items: center; gap: 0.45rem;
+          min-width: 0; flex: 1;
         }
-        .thread-label {
-          font-size: 0.7rem; color: #4a4a4a; letter-spacing: 0.01em;
-          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
+        .card-header-right {
+          display: flex; align-items: center; gap: 0.4rem;
+          flex-shrink: 0;
         }
-        .thread-badge {
-          font-size: 0.65rem; font-weight: 700;
-          background: #1c2d44; color: #60a5fa;
-          border-radius: 4px; padding: 0.1rem 0.4rem;
-          text-transform: uppercase; letter-spacing: 0.04em;
+        .session-id-chip {
+          font-size: 0.65rem; font-family: 'SF Mono', 'Cascadia Code', monospace;
+          color: #444; letter-spacing: 0.04em; flex-shrink: 0;
         }
-
-        /* ---- Item cards ---- */
-        .item-card {
-          padding: 0.85rem 0.85rem 1rem;
-          background: #141414;
+        .session-title {
+          font-size: 0.88rem; font-weight: 600; color: #ccc;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
-        .item-card + .item-card { border-top: 1px solid #1e1e1e; }
-
-        .item-meta {
-          display: flex; align-items: center; flex-wrap: wrap; gap: 0.35rem;
-          margin-bottom: 0.6rem;
+        .item-time {
+          font-size: 0.68rem; color: #444; white-space: nowrap;
         }
 
         /* Kind badges */
         .kind-badge {
-          font-size: 0.65rem; font-weight: 700; text-transform: uppercase;
-          letter-spacing: 0.05em; border-radius: 4px; padding: 0.15rem 0.45rem;
-        }
-        .kind-permission { background: #2d1b00; color: #fb923c; }
-        .kind-question { background: #1a2640; color: #60a5fa; }
-        .kind-done { background: #0f2d1a; color: #4ade80; }
-
-        .meta-chip {
-          font-size: 0.72rem; color: #666;
-          background: #1c1c1c; border: 1px solid #2a2a2a;
-          border-radius: 4px; padding: 0.1rem 0.4rem;
+          font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.04em; border-radius: 4px; padding: 0.15rem 0.45rem;
           white-space: nowrap;
         }
-        .item-time { font-size: 0.7rem; color: #444; margin-left: auto; white-space: nowrap; }
+        .kind-permission { background: #2d1b00; color: #fb923c; }
+        .kind-question   { background: #1a2640; color: #60a5fa; }
+        .kind-done       { background: #0f2d1a; color: #4ade80; }
+
+        /* ---- Card body ---- */
+        .card-body {
+          padding: 0.85rem 0.9rem 0.95rem;
+        }
 
         /* Tool display */
         .tool-row {
           display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.4rem;
         }
-        .tool-label { font-size: 0.7rem; color: #555; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
-        .tool-name { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.85rem; color: #fb923c; }
+        .tool-label {
+          font-size: 0.68rem; color: #555; text-transform: uppercase;
+          letter-spacing: 0.04em; flex-shrink: 0;
+        }
+        .tool-name {
+          font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.85rem; color: #fb923c;
+        }
 
         .input-block {
           background: #0a0a0a; border: 1px solid #222;
@@ -776,47 +809,40 @@ export default function WaitingPage() {
         .cwd-row {
           display: flex; align-items: baseline; gap: 0.4rem; margin-bottom: 0.6rem;
         }
-        .cwd-label { font-size: 0.65rem; color: #444; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
-        .cwd-value { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.7rem; color: #555; word-break: break-all; }
+        .cwd-label {
+          font-size: 0.65rem; color: #444; text-transform: uppercase;
+          letter-spacing: 0.04em; flex-shrink: 0;
+        }
+        .cwd-value {
+          font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.7rem;
+          color: #555; word-break: break-all;
+        }
 
-        /* Permission message fallback (when tool_name/tool_input absent) */
-        .permission-message {
-          font-size: 0.88rem; color: #ccc; line-height: 1.5;
-          margin-bottom: 0.5rem; white-space: pre-wrap;
+        /* Message text (question/done/permission fallback) */
+        .message-text {
+          font-size: 0.9rem; color: #d4d4d4; line-height: 1.6;
+          margin-bottom: 0.75rem; white-space: pre-wrap;
         }
 
         /* Answer-window hint */
-        .answer-window-row {
-          margin-bottom: 0.5rem;
-        }
-        .answer-hint {
-          font-size: 0.7rem; color: #555;
-        }
-        .answer-hint-urgent {
-          color: #f59e0b; font-weight: 600;
-        }
-
-        /* Question / done text */
-        .question-text {
-          font-size: 0.88rem; color: #ccc; line-height: 1.55;
-          margin-bottom: 0.75rem;
-          white-space: pre-wrap;
-        }
+        .answer-window-row { margin-bottom: 0.5rem; }
+        .answer-hint { font-size: 0.7rem; color: #555; }
+        .answer-hint-urgent { color: #f59e0b; font-weight: 600; }
 
         /* Actions */
         .action-row { display: flex; gap: 0.6rem; margin-top: 0.75rem; }
-        .reply-row { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.25rem; }
+        .reply-row  { display: flex; flex-direction: column; gap: 0.5rem; }
 
         .btn {
-          border: none; border-radius: 7px; font-size: 0.9rem; font-weight: 600;
-          cursor: pointer; padding: 0.6rem 1.1rem; transition: opacity 0.12s;
+          border: none; border-radius: 8px; font-size: 0.92rem; font-weight: 600;
+          cursor: pointer; padding: 0.65rem 1.1rem; transition: opacity 0.12s;
           flex-shrink: 0;
         }
         .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-allow { background: #16a34a; color: #fff; flex: 1; }
         .btn-allow:not(:disabled):hover { background: #15803d; }
-        .btn-deny { background: #dc2626; color: #fff; flex: 1; }
-        .btn-deny:not(:disabled):hover { background: #b91c1c; }
+        .btn-deny  { background: #dc2626; color: #fff; flex: 1; }
+        .btn-deny:not(:disabled):hover  { background: #b91c1c; }
         .btn-send {
           background: #e5e5e5; color: #0f0f0f;
           align-self: flex-end; padding: 0.55rem 1.25rem;
@@ -833,55 +859,74 @@ export default function WaitingPage() {
         .reply-input::placeholder { color: #444; }
         .reply-input:disabled { opacity: 0.5; }
 
-        /* ---- History ---- */
-        .history-section {
+        /* ---- History expander ---- */
+        .history-expander {
           border-top: 1px solid #1a1a1a;
         }
-        .history-item {
-          padding: 0.55rem 0.85rem;
-          cursor: pointer;
-          border-top: 1px solid #181818;
-          transition: background 0.1s;
+        .history-toggle-btn {
+          width: 100%;
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 0.5rem 0.9rem;
+          background: none; border: none; cursor: pointer;
+          font-size: 0.72rem; color: #444;
+          transition: color 0.1s;
         }
-        .history-item:first-child { border-top: none; }
-        .history-item:hover { background: #181818; }
-        .history-header {
+        .history-toggle-btn:hover { color: #666; }
+        .history-chevron { font-size: 0.58rem; color: #333; }
+
+        .history-list { border-top: 1px solid #181818; }
+
+        .history-row {
+          padding: 0.5rem 0.9rem;
+          border-top: 1px solid #181818;
+          cursor: pointer; transition: background 0.1s;
+        }
+        .history-row:first-child { border-top: none; }
+        .history-row:hover { background: #181818; }
+
+        .history-row-header {
           display: flex; align-items: center; gap: 0.5rem;
         }
         .history-preview {
-          font-size: 0.75rem; color: #444; font-family: 'SF Mono', 'Cascadia Code', monospace;
+          font-size: 0.73rem; color: #444;
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
         }
-        .history-status {
-          font-size: 0.65rem; color: #3a3a3a; white-space: nowrap;
+        .history-status-chip {
+          font-size: 0.62rem; color: #3a3a3a;
           background: #181818; border-radius: 3px; padding: 0.1rem 0.35rem;
+          white-space: nowrap;
         }
-        .history-time { font-size: 0.65rem; color: #333; white-space: nowrap; }
-        .history-toggle { font-size: 0.6rem; color: #333; flex-shrink: 0; }
-        .history-detail { padding: 0.5rem 0 0.25rem; }
-        .history-meta { display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.35rem; }
+        .history-time { font-size: 0.62rem; color: #333; white-space: nowrap; }
+        .history-row-chevron { font-size: 0.55rem; color: #333; flex-shrink: 0; }
+
+        .history-row-detail { padding: 0.4rem 0 0.2rem; }
         .kind-badge-sm {
-          font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
-          border-radius: 3px; padding: 0.1rem 0.35rem; color: #555; background: #1a1a1a;
+          display: inline-block;
+          font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+          letter-spacing: 0.04em; border-radius: 3px; padding: 0.1rem 0.35rem;
+          color: #555; background: #1a1a1a; margin-bottom: 0.3rem;
         }
-        .meta-chip-sm { font-size: 0.65rem; color: #444; }
         .history-answer { font-size: 0.75rem; color: #4a4a4a; }
         .history-answer-label { color: #3a3a3a; font-weight: 600; }
+
+        /* ---- Resolved footer ---- */
+        .resolved-footer {
+          text-align: center;
+          padding: 0.75rem 0 0.25rem;
+          font-size: 0.72rem; color: #2e2e2e;
+        }
 
         /* ---- Empty state ---- */
         .empty {
           text-align: center; padding: 4rem 1rem;
           display: flex; flex-direction: column; align-items: center; gap: 0.75rem;
         }
-        .empty-icon { font-size: 2rem; opacity: 0.3; }
+        .empty-icon  { font-size: 2rem; opacity: 0.3; }
         .empty-title { font-size: 1rem; font-weight: 600; color: #555; }
-        .empty-sub { font-size: 0.8rem; color: #3a3a3a; }
+        .empty-sub   { font-size: 0.8rem; color: #3a3a3a; }
 
-        /* ---- Loading state ---- */
-        .loading {
-          text-align: center; padding: 4rem 1rem; color: #333;
-          font-size: 0.85rem;
-        }
+        /* ---- Loading ---- */
+        .loading { text-align: center; padding: 4rem 1rem; color: #333; font-size: 0.85rem; }
 
         /* ---- Error banner ---- */
         .error-banner {
@@ -901,9 +946,8 @@ export default function WaitingPage() {
           padding: 0.65rem 1.1rem; border-radius: 8px; font-size: 0.85rem;
           font-weight: 500; z-index: 100; white-space: nowrap;
           box-shadow: 0 4px 24px rgba(0,0,0,0.5);
-          transition: opacity 0.2s;
         }
-        .toast-ok { background: #16a34a; color: #fff; }
+        .toast-ok  { background: #16a34a; color: #fff; }
         .toast-err { background: #dc2626; color: #fff; }
 
         /* ---- Scrollbar ---- */
@@ -919,8 +963,8 @@ export default function WaitingPage() {
             <div className="header-actions">
               <NotificationsButton onToast={showToast} />
             </div>
-            {waitingCount > 0 && (
-              <span className="waiting-count">{waitingCount}</span>
+            {openCount > 0 && (
+              <span className="open-count">{openCount}</span>
             )}
           </div>
         </header>
@@ -934,7 +978,7 @@ export default function WaitingPage() {
 
         {loading && <div className="loading">Loading…</div>}
 
-        {!loading && groups.length === 0 && !error && (
+        {!loading && openGroups.length === 0 && !error && (
           <div className="empty">
             <div className="empty-icon">✓</div>
             <div className="empty-title">Nothing waiting</div>
@@ -942,15 +986,21 @@ export default function WaitingPage() {
           </div>
         )}
 
-        {!loading && groups.map(group => (
-          <Thread
+        {!loading && openGroups.map(group => (
+          <SessionCard
             key={group.thread_id}
             group={group}
-            onAnswer={handlePermissionAnswer}
+            onPermissionAnswer={handlePermissionAnswer}
             onQuestionAnswer={handleQuestionAnswer}
             answering={answering}
           />
         ))}
+
+        {!loading && resolvedGroups.length > 0 && (
+          <div className="resolved-footer">
+            {resolvedGroups.length} resolved {resolvedGroups.length === 1 ? 'thread' : 'threads'} hidden
+          </div>
+        )}
       </div>
 
       {toast && (
