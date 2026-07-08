@@ -36,6 +36,24 @@ export async function POST(req: Request) {
   }
 
   const sql = getDb();
+
+  // Server-side supersede: before inserting, expire any open items in the same
+  // thread so only one actionable item per thread exists on the phone at a time.
+  // This backstops the client-side supersede in dashboard/server/lib/waiting-notifier.js —
+  // if the dashboard server restarts between two Stop events, the in-memory
+  // openItemId mapping is lost and the client-side PATCH never fires. The server
+  // now handles it unconditionally, making orphaned items from restart scenarios
+  // impossible. The client-side supersede remains in place for answered_locally
+  // accuracy when in-memory state exists.
+  await sql`
+    UPDATE waiting_items
+    SET status = 'expired',
+        answered_at = NOW(),
+        answer = ${JSON.stringify({ expired_reason: 'superseded' })}
+    WHERE thread_id = ${thread_id}
+      AND status = 'waiting'
+  `;
+
   const rows = await sql`
     INSERT INTO waiting_items (thread_id, session_id, kind, context)
     VALUES (${thread_id}, ${session_id}, ${kind}, ${JSON.stringify(context)})
