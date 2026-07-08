@@ -26,6 +26,8 @@ export async function GET(
 }
 
 // PATCH /api/waiting/:id — PC marks answered_locally or expired. Bearer auth only.
+// Body: { status: "answered_locally" | "expired", reason?: "timeout" }
+// When status="expired" and reason="timeout", stores answer={expired_reason:"timeout"}.
 export async function PATCH(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -42,7 +44,7 @@ export async function PATCH(
     return Response.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const { status } = body as { status?: string };
+  const { status, reason } = body as { status?: string; reason?: string };
   const validStatuses = ['answered_locally', 'expired'];
   if (!status || !validStatuses.includes(status)) {
     return Response.json(
@@ -52,13 +54,31 @@ export async function PATCH(
   }
 
   const sql = getDb();
-  const rows = await sql`
-    UPDATE waiting_items
-    SET status = ${status},
-        answered_at = NOW()
-    WHERE id = ${id}::uuid
-    RETURNING id, thread_id, session_id, kind, status, answered_at
-  `;
+
+  // When expiring due to timeout, store the reason in the answer column
+  // so the UI can show "Timed out" instead of generic "expired".
+  const isTimeoutExpiry = status === 'expired' && reason === 'timeout';
+
+  let rows;
+  if (isTimeoutExpiry) {
+    rows = await sql`
+      UPDATE waiting_items
+      SET status = ${status},
+          answer = '{"expired_reason":"timeout"}'::jsonb,
+          answered_at = NOW()
+      WHERE id = ${id}::uuid
+      RETURNING id, thread_id, session_id, kind, status, answer, answered_at
+    `;
+  } else {
+    rows = await sql`
+      UPDATE waiting_items
+      SET status = ${status},
+          answered_at = NOW()
+      WHERE id = ${id}::uuid
+      RETURNING id, thread_id, session_id, kind, status, answer, answered_at
+    `;
+  }
+
   if (rows.length === 0) {
     return Response.json({ error: 'Not found' }, { status: 404 });
   }

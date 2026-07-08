@@ -157,9 +157,17 @@ interface WaitingItem {
     project?: string;
   };
   status: 'waiting' | 'answered' | 'answered_locally' | 'expired';
-  answer: { decision?: string; text?: string } | null;
+  answer: { decision?: string; text?: string; expired_reason?: string } | null;
   created_at: string;
   answered_at: string | null;
+}
+
+// Away state (task 430)
+interface AwayState {
+  away: boolean;
+  updated_at: string;
+  last_heartbeat_at: string;
+  pending_request: { away: boolean; requested_at: string } | null;
 }
 
 interface SessionGroup {
@@ -295,6 +303,61 @@ function AnswerWindowHint({ createdAt }: { createdAt: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Away badge (task 430) — shown in the page header
+// ---------------------------------------------------------------------------
+
+// PC is considered unreachable if the heartbeat is older than 3 minutes.
+const PC_UNREACHABLE_MS = 3 * 60 * 1000;
+
+function AwayBadge({
+  awayState,
+  toggling,
+  onToggle,
+}: {
+  awayState: AwayState | null;
+  toggling: boolean;
+  onToggle: () => void;
+}) {
+  if (!awayState) return null;
+
+  const heartbeatAge = awayState.last_heartbeat_at
+    ? Date.now() - new Date(awayState.last_heartbeat_at).getTime()
+    : Infinity;
+  const pcUnreachable = heartbeatAge > PC_UNREACHABLE_MS;
+  const hasPending = awayState.pending_request !== null;
+
+  let label: string;
+  let badgeClass: string;
+
+  if (toggling || hasPending) {
+    label = 'Switching…';
+    badgeClass = 'away-badge away-badge-pending';
+  } else if (pcUnreachable) {
+    label = 'PC unreachable';
+    badgeClass = 'away-badge away-badge-unreachable';
+  } else if (awayState.away) {
+    label = 'Away — permissions come to your phone';
+    badgeClass = 'away-badge away-badge-away';
+  } else {
+    label = 'Here — permissions stay at your desk';
+    badgeClass = 'away-badge away-badge-here';
+  }
+
+  const canToggle = !toggling && !hasPending && !pcUnreachable;
+
+  return (
+    <button
+      className={badgeClass}
+      onClick={canToggle ? onToggle : undefined}
+      disabled={!canToggle}
+      title={canToggle ? (awayState.away ? 'Tap to switch to Here' : 'Tap to switch to Away') : undefined}
+    >
+      {label}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Permission card
 // ---------------------------------------------------------------------------
 
@@ -318,10 +381,13 @@ function PermissionCard({
   item,
   onAnswer,
   answering,
+  precedingTimedOut,
 }: {
   item: WaitingItem;
   onAnswer: (id: string, decision: 'allow' | 'deny') => Promise<void>;
   answering: string | null;
+  /** True when the most recent history item in this thread is an expired-by-timeout gate card (task 433) */
+  precedingTimedOut?: boolean;
 }) {
   const { tool_name, tool_input, cwd, message } = item.context;
   const isAnswering = answering === item.id;
@@ -382,7 +448,11 @@ function PermissionCard({
       ) : (
         <div className="mirror-notice">
           <span className="mirror-icon">⌨️</span>
-          <span className="mirror-text">answer at your desktop</span>
+          <span className="mirror-text">
+            {precedingTimedOut
+              ? 'Timed out on your phone — respond at your PC'
+              : 'answer at your desktop'}
+          </span>
         </div>
       )}
     </div>
@@ -477,9 +547,14 @@ function HistoryExpander({ items }: { items: WaitingItem[] }) {
 function HistoryRow({ item }: { item: WaitingItem }) {
   const [expanded, setExpanded] = useState(false);
 
+  // Task 433: distinguish timeout-expired gate items from normal expiry.
+  const isTimedOut = item.status === 'expired' && item.answer?.expired_reason === 'timeout';
+
   const statusLabel =
     item.status === 'answered_locally'
       ? 'answered locally'
+      : isTimedOut
+      ? 'Timed out'
       : item.status === 'expired'
       ? 'expired'
       : 'answered';
@@ -534,6 +609,17 @@ function SessionCard({
   const hasRealTitle =
     items.some(i => i.context.agent_name || i.context.project);
 
+  // Task 433: detect if the current open mirror item directly follows a timed-out gate item.
+  // Condition: openItem is a non-answerable permission (mirror), AND the most recent
+  // history item is an expired-by-timeout gate item (answerable source).
+  const precedingTimedOut =
+    openItem !== null &&
+    openItem.kind === 'permission' &&
+    !isAnswerableItem(openItem) &&
+    historyItems.length > 0 &&
+    historyItems[0].status === 'expired' &&
+    historyItems[0].answer?.expired_reason === 'timeout';
+
   return (
     <div className="session-card">
       {/* Card header: title + kind badge + time */}
@@ -563,6 +649,7 @@ function SessionCard({
             item={openItem}
             onAnswer={onPermissionAnswer}
             answering={answering}
+            precedingTimedOut={precedingTimedOut}
           />
         ) : (
           <QuestionCard
@@ -594,6 +681,10 @@ export default function WaitingPage() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Away state (task 430)
+  const [awayState, setAwayState] = useState<AwayState | null>(null);
+  const [toggling, setToggling] = useState(false);
+
   const showToast = useCallback((msg: string, ok: boolean) => {
     setToast({ msg, ok });
     if (toastRef.current) clearTimeout(toastRef.current);
@@ -618,13 +709,56 @@ export default function WaitingPage() {
     }
   }, []);
 
+  // Task 430: fetch away state in parallel with items
+  const fetchAwayState = useCallback(async () => {
+    try {
+      const res = await fetch('/api/away-state', { credentials: 'include' });
+      if (res.status === 401) return; // already handled by fetchItems redirect
+      if (!res.ok) return;
+      const data = await res.json() as AwayState;
+      setAwayState(data);
+    } catch {
+      // Non-fatal — away badge just won't show
+    }
+  }, []);
+
+  // Task 430: tap handler — request the opposite away state from the PC
+  const handleToggleAway = useCallback(async () => {
+    if (!awayState || toggling) return;
+    const desiredAway = !awayState.away;
+    setToggling(true);
+    try {
+      const res = await fetch('/api/away-state/request', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ away: desiredAway }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({})) as { error?: string };
+        showToast(d.error ?? `Error ${res.status}`, false);
+        return;
+      }
+      // Optimistically update local state with a pending_request so badge shows "Switching…"
+      setAwayState(prev => prev ? { ...prev, pending_request: { away: desiredAway, requested_at: new Date().toISOString() } } : prev);
+    } catch {
+      showToast('Network error.', false);
+    } finally {
+      setToggling(false);
+    }
+  }, [awayState, toggling, showToast]);
+
   // Initial fetch + 5s polling with hidden-tab pause
   useEffect(() => {
     fetchItems();
+    fetchAwayState();
 
     const startPoll = () => {
       pollRef.current = setInterval(() => {
-        if (!document.hidden) fetchItems();
+        if (!document.hidden) {
+          fetchItems();
+          fetchAwayState();
+        }
       }, 5000);
     };
 
@@ -640,6 +774,7 @@ export default function WaitingPage() {
         stopPoll();
       } else {
         fetchItems();
+        fetchAwayState();
         startPoll();
       }
     };
@@ -650,7 +785,7 @@ export default function WaitingPage() {
       stopPoll();
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [fetchItems]);
+  }, [fetchItems, fetchAwayState]);
 
   const handlePermissionAnswer = useCallback(
     async (id: string, decision: 'allow' | 'deny') => {
@@ -992,6 +1127,33 @@ export default function WaitingPage() {
         .input-block::-webkit-scrollbar { width: 4px; }
         .input-block::-webkit-scrollbar-track { background: transparent; }
         .input-block::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+        /* ---- Away badge (task 430) ---- */
+        .away-badge {
+          display: block; width: 100%;
+          font-size: 0.75rem; font-weight: 500;
+          border-radius: 6px; padding: 0.35rem 0.7rem;
+          margin-bottom: 0.6rem;
+          border: 1px solid transparent;
+          cursor: default;
+          text-align: center;
+          transition: background 0.15s, border-color 0.15s;
+        }
+        .away-badge:not(:disabled) { cursor: pointer; }
+        .away-badge-away {
+          background: #1a1a00; border-color: #4a3800; color: #fbbf24;
+        }
+        .away-badge-away:not(:disabled):active { background: #252500; }
+        .away-badge-here {
+          background: #0a1a0a; border-color: #1a3a1a; color: #4ade80;
+        }
+        .away-badge-here:not(:disabled):active { background: #0f200f; }
+        .away-badge-pending {
+          background: #141414; border-color: #2a2a2a; color: #888;
+        }
+        .away-badge-unreachable {
+          background: #1a0a0a; border-color: #3a1a1a; color: #f87171;
+        }
       `}</style>
 
       <div className="page">
@@ -1006,6 +1168,13 @@ export default function WaitingPage() {
             )}
           </div>
         </header>
+
+        {/* Away badge — full-width tap target below header (task 430) */}
+        <AwayBadge
+          awayState={awayState}
+          toggling={toggling}
+          onToggle={handleToggleAway}
+        />
 
         {error && (
           <div className="error-banner">

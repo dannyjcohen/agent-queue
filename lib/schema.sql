@@ -28,6 +28,24 @@ CREATE TABLE IF NOT EXISTS waiting_items (
 CREATE INDEX IF NOT EXISTS idx_waiting_items_status ON waiting_items(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_waiting_items_thread ON waiting_items(thread_id, created_at);
 
+-- Away state sync (task 430)
+-- Single-row table. The dashboard PC pushes current away boolean + heartbeat here.
+-- The phone reads it to show the current state and detect PC unreachable (heartbeat stale >3 min).
+CREATE TABLE IF NOT EXISTS away_state (
+  id               INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  away             BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Away toggle requests (task 430)
+-- Single-row table. Phone posts desired away state here; PC polls, applies, deletes.
+CREATE TABLE IF NOT EXISTS away_requests (
+  id           INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  away         BOOLEAN NOT NULL,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Web push subscriptions (task 389)
 -- One row per browser subscription endpoint. Pruned automatically on 404/410 from the push service.
 CREATE TABLE IF NOT EXISTS push_subscriptions (
