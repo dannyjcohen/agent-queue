@@ -143,6 +143,9 @@ interface WaitingItem {
     tool_name?: string;
     tool_input?: string | Record<string, unknown>;
     cwd?: string;
+    // source classification (task 428)
+    source?: 'hook-gate' | 'notifier' | string;
+    answerable?: boolean;
     // question / done — new contract from task 425
     last_message?: string;
     // older items / fallbacks
@@ -295,6 +298,22 @@ function AnswerWindowHint({ createdAt }: { createdAt: string }) {
 // Permission card
 // ---------------------------------------------------------------------------
 
+/**
+ * Determine whether a permission item is answerable from the phone.
+ * Hook-gate items are actively polled — Allow/Deny work.
+ * Notifier mirror items are informational — the terminal is the only control.
+ *
+ * Priority:
+ *   1. context.answerable is explicitly set → use it.
+ *   2. Fallback: structured tool_input present → hook-gate (answerable);
+ *      message-only → notifier mirror (not answerable).
+ */
+function isAnswerableItem(item: WaitingItem): boolean {
+  if (typeof item.context.answerable === 'boolean') return item.context.answerable;
+  // Legacy / items posted before task 428: infer from payload shape
+  return !!(item.context.tool_name || item.context.tool_input);
+}
+
 function PermissionCard({
   item,
   onAnswer,
@@ -307,6 +326,7 @@ function PermissionCard({
   const { tool_name, tool_input, cwd, message } = item.context;
   const isAnswering = answering === item.id;
   const hasStructured = !!(tool_name || tool_input);
+  const answerable = isAnswerableItem(item);
 
   return (
     <div className="card-body">
@@ -337,26 +357,34 @@ function PermissionCard({
         </div>
       )}
 
-      <div className="answer-window-row">
-        <AnswerWindowHint createdAt={item.created_at} />
-      </div>
-
-      <div className="action-row">
-        <button
-          className="btn btn-allow"
-          disabled={isAnswering}
-          onClick={() => onAnswer(item.id, 'allow')}
-        >
-          {isAnswering ? '…' : 'Allow'}
-        </button>
-        <button
-          className="btn btn-deny"
-          disabled={isAnswering}
-          onClick={() => onAnswer(item.id, 'deny')}
-        >
-          {isAnswering ? '…' : 'Deny'}
-        </button>
-      </div>
+      {answerable ? (
+        <>
+          <div className="answer-window-row">
+            <AnswerWindowHint createdAt={item.created_at} />
+          </div>
+          <div className="action-row">
+            <button
+              className="btn btn-allow"
+              disabled={isAnswering}
+              onClick={() => onAnswer(item.id, 'allow')}
+            >
+              {isAnswering ? '…' : 'Allow'}
+            </button>
+            <button
+              className="btn btn-deny"
+              disabled={isAnswering}
+              onClick={() => onAnswer(item.id, 'deny')}
+            >
+              {isAnswering ? '…' : 'Deny'}
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="mirror-notice">
+          <span className="mirror-icon">⌨️</span>
+          <span className="mirror-text">answer at your desktop</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -828,6 +856,16 @@ export default function WaitingPage() {
         .answer-window-row { margin-bottom: 0.5rem; }
         .answer-hint { font-size: 0.7rem; color: #555; }
         .answer-hint-urgent { color: #f59e0b; font-weight: 600; }
+
+        /* Mirror notice (notifier-sourced permission items — desktop only) */
+        .mirror-notice {
+          display: flex; align-items: center; gap: 0.4rem;
+          margin-top: 0.75rem; padding: 0.45rem 0.6rem;
+          background: #141414; border: 1px solid #1e1e1e;
+          border-radius: 6px;
+        }
+        .mirror-icon { font-size: 0.85rem; opacity: 0.45; }
+        .mirror-text { font-size: 0.75rem; color: #444; font-style: italic; }
 
         /* Actions */
         .action-row { display: flex; gap: 0.6rem; margin-top: 0.75rem; }
