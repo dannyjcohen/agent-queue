@@ -1,5 +1,6 @@
 import { getDb } from '../../../lib/db';
 import { validateAuth } from '../../../lib/auth';
+import { setDoorbell } from '../../../lib/doorbell';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,5 +25,10 @@ export async function POST(req: Request) {
     VALUES (${type}, ${source as string}, ${JSON.stringify(payload)})
     RETURNING id, type, source, status, created_at
   `;
+
+  // SET the doorbell flag so the local poller knows to check /pending.
+  // Fire-and-forget — a Redis error never blocks the enqueue response.
+  setDoorbell().catch(() => {});
+
   return Response.json(rows[0], { status: 201 });
 }
