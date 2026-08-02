@@ -27,8 +27,11 @@ export async function POST(req: Request) {
   `;
 
   // SET the doorbell flag so the local poller knows to check /pending.
-  // Fire-and-forget — a Redis error never blocks the enqueue response.
-  setDoorbell().catch(() => {});
+  // MUST be awaited: on Vercel serverless, un-awaited work after the
+  // response is frequently dropped — a dropped SET means the enqueued item
+  // waits up to 30 min for the full-check fallback instead of ≤30s.
+  // setDoorbell never throws (internal try/catch), bounded by a 5s timeout.
+  await setDoorbell();
 
   return Response.json(rows[0], { status: 201 });
 }

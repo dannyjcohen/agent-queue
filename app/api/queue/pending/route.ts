@@ -17,10 +17,13 @@ export async function GET(req: Request) {
   `;
 
   // When the queue is empty, clear the doorbell flag so the poller stops
-  // waking Neon on every tick. Fire-and-forget — a Redis error never blocks
-  // the response or changes the returned items.
+  // waking Neon on every tick. MUST be awaited: on Vercel serverless,
+  // un-awaited work after the response is frequently dropped, leaving the
+  // flag stuck at 1 (observed in smoke-test step E, 2026-08-01) — which
+  // makes every 30s knock wake Neon until a DEL finally lands. clearDoorbell
+  // never throws (internal try/catch) and is bounded by a 5s timeout.
   if (items.length === 0) {
-    clearDoorbell().catch(() => {});
+    await clearDoorbell();
   }
 
   return Response.json({ items });
